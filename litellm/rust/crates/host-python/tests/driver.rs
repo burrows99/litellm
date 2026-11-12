@@ -23,8 +23,8 @@ use pyo3::{
 use rstest::rstest;
 use support::{
     HookScript, Interpreter, Log, MachineFactory, OpScript, Synthetic, binding, call_options,
-    failing_machine, handed, hooks, interpreter, lifecycle_module, open_stream, read_all,
-    run_composed, run_scripted, settled, success_machine,
+    failing_machine, handed, hooks, interpreter, lifecycle_module, open_stream, open_stream_from,
+    read_all, run_composed, run_scripted, settled, success_machine, tailed_streaming_machine,
 };
 
 fn observed(capacity: usize) -> (CallOptions, impl FnMut() -> Vec<CallEvent>) {
@@ -400,6 +400,38 @@ fn a_stream_carries_its_head_before_the_first_chunk(
         );
         assert_eq!(log.entries(), ["started", "begin", "opened"]);
         assert_eq!(read_all(py, &stream, asynchronous), ["first", "second"]);
+    });
+}
+
+#[rstest]
+fn chunks_on_the_unobserved_tail_reach_the_caller_without_the_stream_hooks(
+    #[from(interpreter)] _python: Interpreter,
+    #[values(false, true)] asynchronous: bool,
+) {
+    Python::attach(|py| {
+        let log = Log::default();
+        let stream = open_stream_from(
+            py,
+            tailed_streaming_machine(),
+            hooks(&log, HookScript::Plain),
+            call_options(asynchronous),
+        );
+        assert_eq!(
+            read_all(py, &stream, asynchronous),
+            ["first", "second", "trailer"]
+        );
+        assert_eq!(
+            log.entries(),
+            [
+                "started",
+                "begin",
+                "opened",
+                "delivered",
+                "delivered",
+                "succeeded:None",
+                "adapter.close"
+            ]
+        );
     });
 }
 

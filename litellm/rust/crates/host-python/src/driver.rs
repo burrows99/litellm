@@ -14,7 +14,7 @@ use litellm_host::{
     lifecycle::{CallEvent, ExecutionEvent, FailureOrigin, Timing, epoch_seconds},
     machine::{HostFailure, Machine, MachineStep},
     observation::ObservationSender,
-    protocol::{HostRequest, InterceptRequest, Protocol, Reply, StreamDelivery},
+    protocol::{HostRequest, InterceptRequest, Protocol, Reply, StreamDelivery, UnobservedTail},
 };
 
 use crate::PythonHostCalls;
@@ -133,6 +133,8 @@ where
     native: NativeMachine<M>,
     start: Option<StartMachine<ProtocolOf<H>, M>>,
     streaming: bool,
+    detached: bool,
+    unobserved_tail: Option<UnobservedTail>,
 }
 
 impl<H, M, L> CallBody<H, M, L>
@@ -320,6 +322,7 @@ where
             }
             HostRequest::Stream(StreamDelivery::Open(head, reply)) => {
                 self.streaming = true;
+                self.unobserved_tail = ProtocolOf::<H>::unobserved_tail(&head);
                 let head = {
                     let mut parts = self.parts();
                     let Parts { binding, hooks, .. } = &mut *parts;
@@ -333,16 +336,28 @@ where
                 Ok(())
             }
             HostRequest::Stream(StreamDelivery::Chunk(chunk, reply)) => {
+                let observed = !self
+                    .unobserved_tail
+                    .as_ref()
+                    .is_some_and(UnobservedTail::begun);
                 let chunk = {
                     let mut parts = self.parts();
                     let Parts { binding, hooks, .. } = &mut *parts;
                     Python::attach(|py| {
                         let chunk = binding.encode_chunk(py, chunk)?;
-                        hooks.on_stream_chunk(py, &chunk)?;
+                        if observed {
+                            hooks.on_stream_chunk(py, &chunk)?;
+                        }
                         Ok::<_, PyErr>(chunk)
                     })?
                 };
-                reply.send(self.caller.yield_chunk(chunk).await);
+                if self.detached {
+                    reply.send(std::ops::ControlFlow::Break(()));
+                    return Ok(());
+                }
+                let flow = self.caller.yield_chunk(chunk).await;
+                self.detached = flow.is_break();
+                reply.send(flow);
                 Ok(())
             }
         }
@@ -645,6 +660,8 @@ where
                 native: NativeMachine::new(asynchronous),
                 start: Some(Box::new(start)),
                 streaming: false,
+                detached: false,
+                unobserved_tail: None,
             }
             .run()
         }

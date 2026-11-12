@@ -8,7 +8,7 @@ use litellm_host::{
     interceptors::{Interceptors, RawResponse, RequestContext, WireRequest},
     lifecycle::{ExecutionEvent, Timing},
     machine::{CallMachine, MachineFault},
-    protocol::{Protocol, Reply},
+    protocol::{Protocol, Reply, UnobservedTail},
 };
 use litellm_host_python::{
     CallOptions, HookStep, InvokeError, PythonBinding, PythonCallEvent, PythonCallHooks,
@@ -559,7 +559,16 @@ impl Protocol for Streaming {
     type Request = ();
     type HostCall = std::convert::Infallible;
     type Chunk = &'static str;
-    type StreamHead = Vec<(&'static str, &'static str)>;
+    type StreamHead = StreamingHead;
+
+    fn unobserved_tail(head: &StreamingHead) -> Option<UnobservedTail> {
+        head.tail.clone()
+    }
+}
+
+pub struct StreamingHead {
+    headers: Vec<(&'static str, &'static str)>,
+    tail: Option<UnobservedTail>,
 }
 
 pub struct StreamingBinding;
@@ -576,13 +585,9 @@ impl PythonBinding for StreamingBinding {
         Ok(())
     }
 
-    fn encode_stream_head(
-        &mut self,
-        py: Python<'_>,
-        head: Vec<(&'static str, &'static str)>,
-    ) -> PyResult<Py<PyAny>> {
+    fn encode_stream_head(&mut self, py: Python<'_>, head: StreamingHead) -> PyResult<Py<PyAny>> {
         let headers = PyDict::new(py);
-        for (name, value) in head {
+        for (name, value) in head.headers {
             headers.set_item(name, value)?;
         }
         let hidden = PyDict::new(py);
@@ -629,8 +634,35 @@ pub fn streaming_machine() -> impl FnOnce(()) -> HostedMachine<Streaming> + Send
     move |()| {
         hosted_call((), None, |(), _, _, _observations| async {
             Ok(CallOutput::Stream {
-                head: vec![("request-id", "req_1")],
+                head: StreamingHead {
+                    headers: vec![("request-id", "req_1")],
+                    tail: None,
+                },
                 chunks: Box::pin(futures_util::stream::iter([Ok("first"), Ok("second")])),
+            })
+        })
+    }
+}
+
+/// Streams `first` and `second`, then `trailer` on its unobserved tail.
+pub fn tailed_streaming_machine() -> impl FnOnce(()) -> HostedMachine<Streaming> + Send + Sync {
+    move |()| {
+        hosted_call((), None, |(), _, _, _observations| async {
+            let tail = UnobservedTail::default();
+            let begun = tail.clone();
+            let trailer = futures_util::stream::once(async move {
+                begun.begin();
+                Ok("trailer")
+            });
+            Ok(CallOutput::Stream {
+                head: StreamingHead {
+                    headers: Vec::new(),
+                    tail: Some(tail),
+                },
+                chunks: Box::pin(futures_util::StreamExt::chain(
+                    futures_util::stream::iter([Ok("first"), Ok("second")]),
+                    trailer,
+                )),
             })
         })
     }
@@ -642,12 +674,21 @@ pub fn open_stream(
     hooks: SyntheticHooks,
     options: CallOptions,
 ) -> Bound<'_, PyAny> {
+    open_stream_from(py, streaming_machine(), hooks, options)
+}
+
+pub fn open_stream_from(
+    py: Python<'_>,
+    machine: impl FnOnce(()) -> HostedMachine<Streaming> + Send + Sync + 'static,
+    hooks: SyntheticHooks,
+    options: CallOptions,
+) -> Bound<'_, PyAny> {
     let asynchronous = options.asynchronous;
     let handed = handed(
         py,
         run_call(
             py,
-            |_, _, request| Ok(streaming_machine()(request)),
+            move |_, _, request| Ok(machine(request)),
             StreamingBinding,
             hooks,
             PyDict::new(py).unbind(),
