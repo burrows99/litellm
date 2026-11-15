@@ -4,7 +4,7 @@ mod error;
 mod redis;
 mod secrets;
 pub use error::Error;
-pub use redis::RedisClients;
+pub use redis::{RedisClients, router_remote};
 
 use std::{sync::Arc, time::Instant};
 
@@ -41,6 +41,10 @@ pub async fn build_inference(config: &Config) -> Result<Arc<Gateway>, Error> {
     };
     let catalog = Catalog::parse(BUNDLED_REGISTRY)?.value;
     let (router, shaping) = boot::router(config, &lookup, &catalog).await?;
+    let routing = Arc::new(litellm_redis_store::RouterStores::new(
+        None,
+        redis::router_tiers(config, &lookup)?,
+    ));
     let settings = &config.litellm_settings;
     let http_settings = HttpSettings::from_layers([
         HttpSettingsLayer::from_environment(&lookup),
@@ -69,8 +73,17 @@ pub async fn build_inference(config: &Config) -> Result<Arc<Gateway>, Error> {
     ));
     let resources = CoreResources::new(pool);
     Ok(Arc::new(Gateway::new(
-        resources, http, secrets, router, shaping,
+        resources, http, secrets, router, shaping, routing,
     )?))
+}
+
+/// Share the router's routing state through its Redis, when `router_settings` names one.
+pub fn attach_routing(inference: &Gateway, redis: &RedisClients, config: &Config) {
+    if let Some(client) = &redis.router {
+        inference
+            .routing()
+            .attach(router_remote(client.clone(), config));
+    }
 }
 
 pub fn install_crypto_provider() {

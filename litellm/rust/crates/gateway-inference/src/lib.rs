@@ -25,6 +25,7 @@ use litellm_inference_ocr::OcrRoute;
 use litellm_inference_responses::ResponsesRoute;
 use litellm_inference_transcription::AudioTranscriptionRoute;
 use litellm_llms::base_llm::ocr::{handler::OcrClient, settings::OcrSettings};
+use litellm_redis_store::RouterStores;
 use litellm_secrets::source::SecretSource;
 
 pub use error::{BodyError, Error};
@@ -33,8 +34,9 @@ pub use routing::GATEWAY;
 
 pub struct Gateway {
     cache: Option<Arc<dyn litellm_cache_response::ResponseCacheService>>,
-    /// Cooldowns, allowed-fails counters and per-minute usage of the deployments, in this process.
-    routing: Arc<litellm_router_core::InMemoryRouterCache>,
+    /// Cooldowns, allowed-fails counters and per-minute usage of the deployments, shared through
+    /// the router's Redis once one is attached.
+    routing: Arc<RouterStores>,
     /// How the messages route shapes a call to each deployment, by deployment id.
     shaping: HashMap<String, MessagesShaping>,
     pub audio_transcription: AudioTranscriptionRoute,
@@ -56,6 +58,11 @@ impl Gateway {
         }
     }
 
+    /// The routing state the router reads and writes, for the host to attach Redis to.
+    pub fn routing(&self) -> &RouterStores {
+        &self.routing
+    }
+
     /// How the messages route shapes a call to deployment `id`.
     pub(crate) fn shaping(&self, id: &str) -> MessagesShaping {
         self.shaping.get(id).cloned().unwrap_or_default()
@@ -67,12 +74,13 @@ impl Gateway {
         secrets: Arc<dyn SecretSource>,
         router: litellm_router_core::Router,
         shaping: HashMap<String, MessagesShaping>,
+        routing: Arc<RouterStores>,
     ) -> Result<Self, litellm_http::Error> {
         let provider = resources.pool.client(&http, ClientVariant::Provider)?;
         let auth = resources.auth.clone();
         Ok(Self {
             cache: None,
-            routing: Arc::default(),
+            routing,
             shaping,
             audio_transcription: AudioTranscriptionRoute::new(
                 provider.clone(),

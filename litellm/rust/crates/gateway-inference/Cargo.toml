@@ -25,6 +25,7 @@ litellm-host-http.workspace = true
 litellm-host.workspace = true
 litellm-http.workspace = true
 litellm-llms.workspace = true
+litellm-redis-store.workspace = true
 litellm-router-core.workspace = true
 litellm-router-types.workspace = true
 litellm-secrets.workspace = true
